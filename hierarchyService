@@ -1,0 +1,296 @@
+package com.db.rds.platform.prds.sourcing.day0.service;
+ 
+import com.db.rds.platform.common.models.models.Node;                       // TODO: adjust import
+import com.db.rds.platform.common.models.models.PrimaryIdentifier;
+import com.db.rds.platform.prds.sourcing.day0.model.NodeLevel;              // TODO: adjust import
+import com.db.rds.platform.prds.sourcing.day0.model.ProductHierarchyData;   // TODO: adjust import
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.bson.Document;
+import org.springframework.stereotype.Service;
+ 
+import java.util.*;
+import java.util.stream.Collectors;
+ 
+/**
+ * One service, two jobs, ONE identity rule: a node is identified by
+ *
+ *      hierarchyName + nodeName + hierarchyPath      (no Oracle id is stored or used as a key)
+ *
+ *  1. findExistingIdentifier(...)  - called by ingestion so re-runs update nodes instead of duplicating them.
+ *  2. reconcile(...)               - read-only comparison of on-prem data vs the target (Mongo).
+ *
+ * Reconciliation compares FULL PATHS (root/child/leaf) built from node names on both sides. A node under the
+ * wrong parent therefore has a different path and is reported, even though its own name looks right.
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class HierarchyNodeService {
+ 
+    private final MigrationNodePrimeDataService primeData;   // TODO: adjust type/import
+ 
+    // =====================================================================================
+    // Result types
+    // =====================================================================================
+ 
+    public enum DiffType {
+        MISSING_IN_TARGET,       // path exists on-prem, not in Mongo
+        EXTRA_IN_TARGET,         // path exists in Mongo, not on-prem (stray copies land here)
+        DUPLICATE_IN_TARGET,     // same path stored more than once in Mongo  <- the re-run bug
+        PARENT_MISMATCH,         // same node name, but under a different parent path (level usually differs too)
+        LEVEL_MISMATCH,
+        PATH_MISMATCH,           // stored hierarchyPath differs from on-prem node path
+        ORPHAN,                  // parent reference points outside the hierarchy
+        CYCLE,                   // node is its own ancestor
+        SOURCE_NAME_MISSING,     // on-prem row without a node name
+        SOURCE_AMBIGUOUS_PATH    // several distinct on-prem rows share one name path (cannot be told apart)
+    }
+ 
+    public record ReconDifference(DiffType type, String key, String field,
+                                  String sourceValue, String targetValue) {}
+ 
+    public record ReconReport(String hierarchyName, int sourceNodeCount, int targetNodeCount,
+                              Map<DiffType, Long> countsByType, List<ReconDifference> differences) {
+        public boolean passed() { return differences.isEmpty(); }
+    }
+ 
+    private record SrcNode(String key, String name, String level, String storedPath) {}
+ 
+    private record TgtNode(String mongoId, String name, String level, String storedPath) {}
+ 
+    // =====================================================================================
+    // 1. Ingestion helper: find the node that already exists for this name + path
+    // =====================================================================================
+ 
+    /**
+     * Returns the identifier of the node already stored for (hierarchyName, nodeName, hierarchyPath),
+     * or null if none exists. Same three fields that ingestion saves on the Node.
+     */
+    public PrimaryIdentifier findExistingIdentifier(String hierarchyName, String nodeName, String nodePath) {
+        if (hierarchyName == null || nodeName == null || nodePath == null) {
+            log.warn("Existing-node lookup skipped, null field: {}/{}/{} - a new node will be created",
+                    hierarchyName, nodeName, nodePath);
+            return null;
+        }
+ 
+        List<Node> matches;
+        try {
+            matches = primeData.findByQuery(new Document("data.hierarchyName", hierarchyName)
+                            .append("data.nodeName", nodeName)
+                            .append("data.hierarchyPath", nodePath)
+                            .toJson())
+                    .collect(Collectors.toList());
+        } catch (Exception e) {
+            // never swallow: a failing query must not silently turn into "create a new node"
+            throw new IllegalStateException(
+                    "Existing-node lookup failed for " + hierarchyName + "/" + nodeName + "/" + nodePath, e);
+        }
+ 
+        if (matches.isEmpty()) {
+            return null;
+        }
+        if (matches.size() > 1) {
+            log.warn("{} nodes already stored for {}/{}/{} - reusing the first; run recon to clean up",
+                    matches.size(), hierarchyName, nodeName, nodePath);
+        }
+        return matches.get(0).getIdentifier();
+    }
+ 
+    /** Same identity rule, usable as the in-run cache key in ingestion. */
+    public static String naturalKey(String hierarchyName, String nodeName, String nodePath) {
+        return nz(hierarchyName) + "|" + nz(nodeName) + "|" + nz(nodePath);
+    }
+ 
+    // =====================================================================================
+    // 2. Reconciliation
+    // =====================================================================================
+ 
+    public ReconReport reconcile(String hierarchyName, List<ProductHierarchyData> sourceProducts) {
+        List<ReconDifference> diffs = new ArrayList<>();
+ 
+        Map<String, SrcNode> source = buildSource(hierarchyName, sourceProducts, diffs);
+        Map<String, List<TgtNode>> target = loadTarget(hierarchyName, diffs);
+ 
+        Set<String> missing = new LinkedHashSet<>();
+        Set<String> extra = new LinkedHashSet<>();
+ 
+        // ---- on-prem -> target ----
+        for (SrcNode s : source.values()) {
+            List<TgtNode> found = target.get(s.key());
+            if (found == null || found.isEmpty()) {
+                missing.add(s.key());
+                continue;
+            }
+            if (found.size() > 1) {
+                diffs.add(new ReconDifference(DiffType.DUPLICATE_IN_TARGET, s.key(), "count", "1",
+                        found.size() + " nodes: " + found.stream().map(TgtNode::mongoId).collect(Collectors.joining(","))));
+            }
+            TgtNode t = found.get(0);
+            if (!Objects.equals(s.level(), t.level())) {
+                diffs.add(new ReconDifference(DiffType.LEVEL_MISMATCH, s.key(), "level", s.level(), t.level()));
+            }
+            if (s.storedPath() != null && !Objects.equals(s.storedPath(), t.storedPath())) {
+                diffs.add(new ReconDifference(DiffType.PATH_MISMATCH, s.key(), "hierarchyPath", s.storedPath(), t.storedPath()));
+            }
+        }
+ 
+        // ---- target -> on-prem ----
+        for (String key : target.keySet()) {
+            if (!source.containsKey(key)) {
+                extra.add(key);
+            }
+        }
+ 
+        // ---- same node name once on each list => the node exists but sits under a different parent ----
+        Map<String, List<String>> missingByName = group(missing, k -> source.get(k).name());
+        Map<String, List<String>> extraByName = group(extra, k -> target.get(k).get(0).name());
+        for (Map.Entry<String, List<String>> e : missingByName.entrySet()) {
+            List<String> extraKeys = extraByName.get(e.getKey());
+            if (e.getValue().size() == 1 && extraKeys != null && extraKeys.size() == 1) {
+                String mk = e.getValue().get(0);
+                String ek = extraKeys.get(0);
+                diffs.add(new ReconDifference(DiffType.PARENT_MISMATCH, mk, "path", mk, ek));
+                missing.remove(mk);
+                extra.remove(ek);
+            }
+        }
+ 
+        for (String k : missing) {
+            diffs.add(new ReconDifference(DiffType.MISSING_IN_TARGET, k, "node", source.get(k).name(), null));
+        }
+        for (String k : extra) {
+            diffs.add(new ReconDifference(DiffType.EXTRA_IN_TARGET, k, "node", null,
+                    target.get(k).stream().map(TgtNode::mongoId).collect(Collectors.joining(","))));
+        }
+ 
+        Map<DiffType, Long> counts = diffs.stream().collect(Collectors.groupingBy(
+                ReconDifference::type, () -> new EnumMap<>(DiffType.class), Collectors.counting()));
+        int targetCount = target.values().stream().mapToInt(List::size).sum();
+ 
+        log.info("Recon [{}]: source={}, target={}, differences={}", hierarchyName, source.size(), targetCount, diffs.size());
+        return new ReconReport(hierarchyName, source.size(), targetCount, counts, diffs);
+    }
+ 
+    // -------------------------------------------------------------------------------------
+    // On-prem side: same rules as ingestion (levels root -> leaf; self-parent guard => root)
+    // -------------------------------------------------------------------------------------
+    private Map<String, SrcNode> buildSource(String hierarchy, List<ProductHierarchyData> products,
+                                             List<ReconDifference> diffs) {
+        Map<String, SrcNode> nodes = new LinkedHashMap<>();
+        Map<String, Set<String>> rowRefs = new HashMap<>();   // in-memory only, to flag ambiguous paths
+ 
+        for (ProductHierarchyData p : products) {
+            if (p.getHierarchyLevels() == null) continue;
+ 
+            List<String> chain = new ArrayList<>();
+            String prevName = null;
+            String prevRef = null;
+ 
+            for (NodeLevel l : p.getHierarchyLevels()) {
+                String name = trim(l.getNodeName());
+                if (name == null) {
+                    diffs.add(new ReconDifference(DiffType.SOURCE_NAME_MISSING,
+                            String.valueOf(p.getProductId()), "nodeName", null, null));
+                    continue;
+                }
+ 
+                // Mirrors ingestion: same name (or same on-prem row) as the previous level => treat as root.
+                // The on-prem id is read here only transiently for that guard; it is never stored or used as a key.
+                String ref = l.getSourceNodeId();
+                boolean selfParent = prevName != null
+                        && (name.equals(prevName) || (ref != null && ref.equals(prevRef)));
+                if (selfParent) chain.clear();
+ 
+                chain.add(name);
+                String key = pathKey(hierarchy, chain);
+ 
+                nodes.putIfAbsent(key, new SrcNode(key, name,
+                        String.valueOf(l.getLevel().longValue()), trim(l.getNodePath())));
+                if (ref != null) rowRefs.computeIfAbsent(key, k -> new HashSet<>()).add(ref);
+ 
+                prevName = name;
+                prevRef = ref;
+            }
+        }
+ 
+        rowRefs.forEach((key, refs) -> {
+            if (refs.size() > 1) {
+                diffs.add(new ReconDifference(DiffType.SOURCE_AMBIGUOUS_PATH, key, "distinctSourceRows",
+                        String.valueOf(refs.size()), null));
+            }
+        });
+        return nodes;
+    }
+ 
+    // -------------------------------------------------------------------------------------
+    // Target side: rebuild each node's full name path by walking the Mongo parent chain.
+    // Lists are kept per key so duplicates stay visible.
+    // -------------------------------------------------------------------------------------
+    private Map<String, List<TgtNode>> loadTarget(String hierarchy, List<ReconDifference> diffs) {
+        Map<String, Node> byId = new LinkedHashMap<>();
+        primeData.findByQuery(new Document("data.hierarchyName", hierarchy).toJson())
+                .forEach(n -> byId.putIfAbsent(mongoId(n), n));
+ 
+        Map<String, List<TgtNode>> byKey = new LinkedHashMap<>();
+        for (Node n : byId.values()) {
+            List<String> chain = nameChain(n, byId, diffs);
+            String key = pathKey(hierarchy, chain);
+            byKey.computeIfAbsent(key, k -> new ArrayList<>())
+                    .add(new TgtNode(mongoId(n), trim(n.getNodeName()),
+                            String.valueOf(n.getLevelNumber()), trim(n.getHierarchyPath())));
+        }
+        return byKey;
+    }
+ 
+    /** root -> ... -> node names; reports ORPHAN (parent missing) and CYCLE while walking. */
+    private List<String> nameChain(Node start, Map<String, Node> byId, List<ReconDifference> diffs) {
+        LinkedList<String> chain = new LinkedList<>();
+        Set<String> seen = new HashSet<>();
+        Node cur = start;
+ 
+        while (cur != null) {
+            if (!seen.add(mongoId(cur))) {
+                diffs.add(new ReconDifference(DiffType.CYCLE, mongoId(start), "parent", null, mongoId(cur)));
+                break;
+            }
+            chain.addFirst(nz(trim(cur.getNodeName())));
+ 
+            Node parentRef = cur.getParentNode();
+            if (parentRef == null) break;
+ 
+            Node next = byId.get(mongoId(parentRef));
+            if (next == null) {
+                diffs.add(new ReconDifference(DiffType.ORPHAN, mongoId(cur), "parent", null, mongoId(parentRef)));
+                break;
+            }
+            cur = next;
+        }
+        return chain;
+    }
+ 
+    // =====================================================================================
+    // helpers
+    // =====================================================================================
+ 
+    private static String pathKey(String hierarchy, List<String> names) {
+        return nz(hierarchy) + "|" + String.join("/", names);
+    }
+ 
+    private static Map<String, List<String>> group(Set<String> keys, java.util.function.Function<String, String> nameOf) {
+        return keys.stream().collect(Collectors.groupingBy(nameOf, LinkedHashMap::new, Collectors.toList()));
+    }
+ 
+    private static String mongoId(Node n) {
+        return String.valueOf(n.getIdentifier().getId());
+    }
+ 
+    private static String trim(String s) {
+        return (s == null || s.isBlank()) ? null : s.trim();
+    }
+ 
+    private static String nz(String s) {
+        return s == null ? "" : s;
+    }
+}
+ 
